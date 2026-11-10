@@ -83,3 +83,49 @@
 3) 대용량 영상 자동 압축:
    25MB 넘는 영상도 스마트폰으로 받을 수 있도록
    자동 리사이즈(용량 압축) 기능 추가
+
+
+5. 24시간 무료 클라우드(Render) 배포 가이드
+--------------------------------------------------
+내 컴퓨터를 꺼도 봇이 24시간 돌아가게 하는 검증된 완전 무료 루트입니다.
+(신용카드 불필요, 월 750시간 무료 = 24시간 365일 상주 가능)
+
+[1단계] Render 가입
+- render.com 접속 -> [Get Started for Free] 클릭
+- [GitHub] 버튼으로 1초 로그인
+
+[2단계] 저장소 연결
+- Render 대시보드 우측 상단 [New +] -> [Web Service] 클릭
+- [Build and deploy from a Git repository] 선택 -> [Next]
+- GitHub 계정 연결 후 'maenglion/record-coooo' 저장소 선택 -> [Connect]
+
+[3단계] 서비스 설정 (대부분 자동 입력됨)
+- Name: video-discord-bot (아무 이름)
+- Region: Singapore 또는 Oregon
+- Runtime: Python 3
+- Build Command: pip install -r requirements.txt
+- Start Command: python bot_discord.py
+- Instance Type: Free (512MB RAM) 선택
+
+[4단계] 봇 토큰 비밀번호 등록
+- 같은 페이지 아래 [Environment Variables] 섹션에서
+  Key:   DISCORD_TOKEN
+  Value: (메모장에 복사해 둔 봇 토큰 문자열)
+- 페이지 맨 아래 [Create Web Service] 클릭!
+
+[5단계] 잠들지 않게 무료 모니터(UptimeRobot) 연결 (가장 중요)
+- Render 무료 플랜은 15분간 접속이 없으면 잠듭니다.
+- 봇이 내장 헬스체크 주소를 갖고 있으므로, 무료 핑 서비스를 붙입니다.
+- uptimerobot.com 접속 -> 무료 가입 -> [Add New Monitor]
+  * Monitor Type: HTTP(s)
+  * Friendly Name: 내 디스코드 봇
+  * URL (or IP): https://내서비스이름.onrender.com
+  * Monitoring Interval: 5분
+  * [Create Monitor] 클릭
+- 이제 5분마다 Render를 쿡 찔러주므로 절대 잠들지 않고 24시간 동작합니다.
+
+[주의 한계점]
+- Render 무료 RAM은 512MB입니다. 인스타 릴스/트위터/쇼츠 영상(200MB 이하)은
+  안정적으로 합체되지만, 30분짜리 4K 영상 등 초고화질 대용량 변환 시
+  일시적인 메모리 부족(OOM)으로 프로세스가 재시작될 수 있습니다.
+- 25MB 전송 한도는 디스코드 자체 정책이므로 클라우드에서도 동일하게 적용됩니다.
