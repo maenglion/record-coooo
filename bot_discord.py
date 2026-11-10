@@ -3,10 +3,58 @@ import sys
 import re
 import asyncio
 import subprocess
+import logging
+from logging.handlers import RotatingFileHandler
+import traceback
 from aiohttp import web
 import discord
 from discord.ext import commands
 import yt_dlp
+
+# --- 로깅 설정 (ERROR 전용 log + 앱 전체 log 분리, 파일 순환 보관) ---
+LOG_DIR = os.getenv("LOG_DIR", "./logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+logger = logging.getLogger("video_bot")
+logger.setLevel(logging.INFO)
+
+error_handler = RotatingFileHandler(
+    os.path.join(LOG_DIR, "error.log"),
+    maxBytes=2 * 1024 * 1024,   # 2MB마다 새 파일로 순환
+    backupCount=5,
+    encoding="utf-8",
+)
+error_handler.setLevel(logging.ERROR)
+error_handler.setFormatter(logging.Formatter(
+    "[%(asctime)s] %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+))
+
+app_handler = RotatingFileHandler(
+    os.path.join(LOG_DIR, "app.log"),
+    maxBytes=2 * 1024 * 1024,
+    backupCount=3,
+    encoding="utf-8",
+)
+app_handler.setLevel(logging.INFO)
+app_handler.setFormatter(logging.Formatter(
+    "[%(asctime)s] %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+))
+
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+
+logger.addHandler(error_handler)
+logger.addHandler(app_handler)
+logger.addHandler(console_handler)
+
+def log_error(context: str, exc: Exception, **meta):
+    """에러를 error.log에 풀 트레이스백과 함께 자동 기록"""
+    meta_str = " | ".join(f"{k}={v}" for k, v in meta.items() if v)
+    tail = f" ({meta_str})" if meta_str else ""
+    logger.error(
+        f"{context}{tail}: {exc}\n{''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))}"
+    )
 
 # --- ffmpeg 경로 자동 감지 ---
 def get_ffmpeg_path():
@@ -25,8 +73,8 @@ def get_video_duration(ffmpeg_exe: str, video_path: str):
         if m:
             h, mi, s = m.groups()
             return int(h) * 3600 + int(mi) * 60 + float(s)
-    except Exception:
-        pass
+    except Exception as exc:
+        log_error("영상 재생시간 파싱 실패", exc, file=video_path)
     return None
 
 # --- 디스코드 25MB 한도 맞춤 자동 압축 ---
@@ -44,7 +92,6 @@ def compress_video(ffmpeg_exe: str, input_path: str, target_mb: float = 23.0) ->
         audio_bitrate = min(96000, total_bitrate * 0.15)
         video_bitrate = max(120000, total_bitrate - audio_bitrate)
 
-        # 비트레이트 수준에 맞춰 해상도 자동 다운스케일
         if video_bitrate < 400000:
             scale = "scale='min(854,iw)':-2"
         elif video_bitrate < 900000:
@@ -64,7 +111,6 @@ def compress_video(ffmpeg_exe: str, input_path: str, target_mb: float = 23.0) ->
             out_path,
         ]
     else:
-        # 재생시간을 읽지 못했을 때의 안전한 폴백(CRF 기반)
         cmd = [
             ffmpeg_exe, "-y", "-i", input_path,
             "-vf", "scale='min(1280,iw)':-2",
@@ -77,7 +123,9 @@ def compress_video(ffmpeg_exe: str, input_path: str, target_mb: float = 23.0) ->
 
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
     if r.returncode != 0:
-        raise RuntimeError((r.stderr or "")[-600:])
+        err = RuntimeError((r.stderr or "")[-600:])
+        log_error("ffmpeg 압축 실패", err, file=input_path)
+        raise err
     return out_path
 
 # --- 미디어 다운로드 핵심 함수 ---
@@ -114,8 +162,31 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
-    print(f"\n[성공] 디스코드 봇 로그인 완료: {bot.user}")
+    logger.info(f"디스코드 봇 로그인 완료: {bot.user}")
     print("스마트폰 디스코드 앱에서 봇에게 인스타/트위터/유튜브/틱톡/스레드 링크를 보내보세요.")
+
+# --- 에러 로그 즉시 조회 명령어 (!logs / !log) ---
+@bot.command(name="logs", aliases=["log"])
+async def show_logs(ctx, lines: int = 25):
+    """최근 에러 로그를 디스코드 채팅으로 조회"""
+    log_file = os.path.join(LOG_DIR, "error.log")
+    if not os.path.exists(log_file) or os.path.getsize(log_file) == 0:
+        await ctx.reply("기록된 에러 로그가 없습니다. (정상 작동 중)")
+        return
+    try:
+        with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+            all_lines = f.readlines()
+        tail = "".join(all_lines[-max(1, lines):])
+        if len(tail) <= 1900:
+            await ctx.reply(f"```{tail}```")
+        else:
+            await ctx.reply(
+                "최근 에러 로그가 길어 파일로 첨부합니다:",
+                file=discord.File(log_file, filename="error.log"),
+            )
+    except Exception as exc:
+        log_error("!logs 명령어 처리 실패", exc)
+        await ctx.reply(f"로그 파일 읽기 실패: {exc}")
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -123,57 +194,72 @@ async def on_message(message: discord.Message):
         return
 
     content = message.content.strip()
-    supported = [
-        "instagram.com/reel", "instagram.com/p/",
-        "twitter.com", "x.com",
-        "youtube.com", "youtu.be",
-        "tiktok.com",
-        "threads.net", "threads.com",
-    ]
-    if any(k in content for k in supported):
-        status_msg = await message.reply("⏳ 영상 다운로드 중입니다. 잠시만 기다려주세요...")
-        try:
-            loop = asyncio.get_event_loop()
-            video_path, title = await loop.run_in_executor(None, download_video, content)
 
-            file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
-            send_path = video_path
+    # 명령어가 아닌 경우만 링크 감지
+    if not content.startswith(bot.command_prefix):
+        supported = [
+            "instagram.com/reel", "instagram.com/p/",
+            "twitter.com", "x.com",
+            "youtube.com", "youtu.be",
+            "tiktok.com",
+            "threads.net", "threads.com",
+        ]
+        if any(k in content for k in supported):
+            logger.info(f"다운로드 요청: user={message.author} channel={message.channel} url={content}")
+            status_msg = await message.reply("⏳ 영상 다운로드 중입니다. 잠시만 기다려주세요...")
+            try:
+                loop = asyncio.get_event_loop()
+                video_path, title = await loop.run_in_executor(None, download_video, content)
 
-            # 25MB 초과 시 디스코드 전송용 자동 압축
-            if file_size_mb > 24.5:
-                await status_msg.edit(
-                    content=f"⚠️ 영상 크기({file_size_mb:.1f}MB)가 디스코드 한도(25MB)를 초과하여 자동 압축 중입니다... "
-                            f"(길이에 따라 30초~2분 소요)"
-                )
-                try:
-                    ffmpeg_exe = get_ffmpeg_path()
-                    compressed = await loop.run_in_executor(
-                        None, compress_video, ffmpeg_exe, video_path, 23.0
-                    )
-                    new_size = os.path.getsize(compressed) / (1024 * 1024)
-                    print(f"[압축 완료] {file_size_mb:.1f}MB -> {new_size:.1f}MB")
-                    send_path = compressed
-                except Exception as ce:
+                file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+                send_path = video_path
+
+                # 25MB 초과 시 디스코드 전송용 자동 압축
+                if file_size_mb > 24.5:
                     await status_msg.edit(
-                        content=f"❌ 자동 압축 실패: {ce}\n원본 영상은 서버 downloads 폴더에만 보관되었습니다."
+                        content=f"⚠️ 영상 크기({file_size_mb:.1f}MB)가 디스코드 한도(25MB)를 초과하여 자동 압축 중입니다... "
+                                f"(길이에 따라 30초~2분 소요)"
                     )
-                    return
+                    try:
+                        ffmpeg_exe = get_ffmpeg_path()
+                        compressed = await loop.run_in_executor(
+                            None, compress_video, ffmpeg_exe, video_path, 23.0
+                        )
+                        new_size = os.path.getsize(compressed) / (1024 * 1024)
+                        logger.info(f"압축 완료: {file_size_mb:.1f}MB -> {new_size:.1f}MB url={content}")
+                        send_path = compressed
+                    except Exception as ce:
+                        log_error("자동 압축 처리 실패", ce, url=content, user=str(message.author))
+                        await status_msg.edit(
+                            content=f"❌ 자동 압축 실패: {ce}\n원본 영상은 서버 downloads 폴더에만 보관되었습니다.\n"
+                                    f"(상세 로그는 `!logs` 명령어로 확인 가능합니다.)"
+                        )
+                        return
 
-            await status_msg.edit(content="📤 영상을 업로드하는 중입니다...")
-            await message.reply(file=discord.File(send_path))
-            await status_msg.delete()
+                await status_msg.edit(content="📤 영상을 업로드하는 중입니다...")
+                await message.reply(file=discord.File(send_path))
+                await status_msg.delete()
+                logger.info(f"전송 완료: {title} ({os.path.basename(send_path)})")
 
-            # 압축 임시 파일 정리 (원본은 downloads에 계속 보관)
-            if send_path != video_path and os.path.exists(send_path):
-                try:
-                    os.remove(send_path)
-                except OSError:
-                    pass
+                # 압축 임시 파일 정리 (원본은 downloads에 계속 보관)
+                if send_path != video_path and os.path.exists(send_path):
+                    try:
+                        os.remove(send_path)
+                    except OSError as exc:
+                        log_error("압축 임시파일 삭제 실패", exc, path=send_path)
 
-        except yt_dlp.utils.DownloadError as e:
-            await status_msg.edit(content=f"❌ 다운로드 실패 (비공개 또는 잘못된 링크): {e}")
-        except Exception as e:
-            await status_msg.edit(content=f"❌ 처리 중 오류 발생: {e}")
+            except yt_dlp.utils.DownloadError as e:
+                log_error("다운로드 실패 (yt-dlp)", e, url=content, user=str(message.author))
+                await status_msg.edit(
+                    content=f"❌ 다운로드 실패 (비공개 또는 잘못된 링크): {e}\n"
+                            f"(상세 로그는 `!logs` 명령어로 확인 가능합니다.)"
+                )
+            except Exception as e:
+                log_error("처리 중 예외 발생", e, url=content, user=str(message.author))
+                await status_msg.edit(
+                    content=f"❌ 처리 중 오류 발생: {e}\n"
+                            f"(상세 로그는 `!logs` 명령어로 확인 가능합니다.)"
+                )
 
     await bot.process_commands(message)
 
@@ -190,7 +276,7 @@ async def start_health_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"[HTTP] 헬스체크 서버 시작: 포트 {port}")
+    logger.info(f"헬스체크 웹 서버 시작: 포트 {port}")
 
 # --- 엔트리포인트 ---
 async def main():
@@ -201,7 +287,7 @@ async def main():
         except EOFError:
             token = ""
     if not token:
-        print("[오류] DISCORD_TOKEN 환경변수 또는 토큰 입력이 필요합니다.")
+        logger.error("DISCORD_TOKEN 환경변수 또는 토큰 입력이 필요합니다.")
         sys.exit(1)
 
     await start_health_server()
@@ -211,4 +297,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, asyncio.CancelledError):
-        print("\n봇이 안전하게 종료되었습니다.")
+        logger.info("봇이 안전하게 종료되었습니다.")

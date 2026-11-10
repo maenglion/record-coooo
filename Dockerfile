@@ -9,8 +9,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # copy application files
 COPY . .
 
-# create downloads directory
-RUN mkdir -p /app/downloads
+# create runtime directories
+RUN mkdir -p /app/downloads /app/logs
 
 ENV PORT=10000
 EXPOSE 10000
