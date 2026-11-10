@@ -56,7 +56,9 @@ async def on_message(message: discord.Message):
 
     content = message.content.strip()
     # 인스타그램 또는 트위터(X) 링크인지 판별
-    if any(k in content for k in ["instagram.com/reel", "instagram.com/p/", "twitter.com", "x.com"]):
+    # 인스타그램, 트위터(X), 유튜브(쇼츠 포함), 틱톡 링크 감지
+    supported = ["instagram.com/reel", "instagram.com/p/", "twitter.com", "x.com", "youtube.com", "youtu.be", "tiktok.com"]
+    if any(k in content for k in supported):
         status_msg = await message.reply("⏳ 영상 다운로드 중입니다. 잠시만 기다려주세요...")
         try:
             # yt-dlp 동기 함수를 비동기 스레드로 실행 (봇이 멈추지 않음)
