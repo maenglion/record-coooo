@@ -1,2 +1,3 @@
 yt-dlp>=2026.10.26
 imageio-ffmpeg
+yt-dlp-threads
