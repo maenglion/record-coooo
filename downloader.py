@@ -24,6 +24,8 @@ def download_video(url: str, output_dir: str = "./downloads"):
         'format': 'bestvideo+bestaudio/best',
         'merge_output_format': 'mp4',
         'outtmpl': os.path.join(output_dir, '%(title).50s [%(id)s].%(ext)s'),
+        'nopart': True,
+        'windowsfilenames': True,
         'quiet': False,
         'no_warnings': True,
     }

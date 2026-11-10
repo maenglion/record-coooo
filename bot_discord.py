@@ -21,6 +21,8 @@ def download_video(url: str, output_dir: str = "./downloads"):
         'format': 'bestvideo+bestaudio/best',
         'merge_output_format': 'mp4',
         'outtmpl': out_tmpl,
+        'nopart': True,
+        'windowsfilenames': True,
         'quiet': True,
         'no_warnings': True,
     }
