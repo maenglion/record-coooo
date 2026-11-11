@@ -4,3 +4,6 @@ __pycache__/
 *.pyc
 venv/
 .venv/
+cookies_base64.txt
+cookies.txt
+*.b64
