@@ -254,15 +254,13 @@ async def on_ready():
     logger.info(f"디스코드 봇 로그인 완료: {bot.user}")
     print("스마트폰 디스코드 앱에서 봇에게 인스타/트위터/유튜브/틱톡/스레드 링크를 보내보세요.")
 
-    announce_flag = os.path.join(LOG_DIR, ".announced_v7")
+    announce_flag = os.path.join(LOG_DIR, ".announced_diagnostics_v1")
     if not os.path.exists(announce_flag):
         body = (
             "📢 **MyVideoDownloader 봇 업데이트 공지**\n"
-            "▫ 다중영상(1/2, 2/2) 분할 전송 기능 복구 완료\n"
-            "▫ 작업 완전 분리(누군가의 실패가 다른 사람 요청에 영향 없음)\n"
-            "▫ 차단 영상 10분 후 자동 재시도 안내 시스템 적용\n"
-            "▫ 대용량 영상 25MB 이하 자동 압축 유지\n"
-            "※ 유튜브/인스타 일부 차단은 로그인 쿠키 설정 후 완전 정상화됩니다 (트위터/틱톡/스레드는 정상)"
+            "▫ 다운로드 요청별 쿠키 파일 충돌 방지\n"
+            "▫ 유튜브 오류 원인을 구분할 수 있도록 진단 안내 개선\n"
+            "※ 유튜브 다운로드는 여전히 실패할 수 있으며, 문제가 있으면 오류 안내를 관리자에게 알려주세요."
         )
         for guild in bot.guilds:
             for ch in guild.text_channels:
@@ -402,7 +400,7 @@ async def auto_retry_worker(url: str, channel_id: int, user_mention: str, origin
         msg, _ = friendly_error_message(str(exc), getattr(exc, 'diagnostic_flags', ()))
         try:
             await channel.send(
-                f"{user_mention} ❌ 10분 후 자동 재시도했으나 여전히 차단 상태입니다.\n{msg}\n"
+                f"{user_mention} ❌ 10분 후 자동 재시도했으나 완료되지 않았습니다.\n{msg}\n"
                 f"나중에 다시 올려주세요. (상세 로그: `!logs`)"
             )
         except Exception:
@@ -518,7 +516,7 @@ async def on_message(message: discord.Message):
                 )
                 auto_retry_tasks[content] = task
                 await message.reply(
-                    f"⚠️ 이 영상은 플랫폼 일시 차단으로 방금 실패했습니다. 같은 링크를 연속 전송하면 차단이 길어집니다.\n"
+                    f"⚠️ 이 영상은 방금 다운로드에 실패했습니다.\n"
                     f"⏳ **10분 후 봇이 자동으로 1회 재시도**해 드릴게요! 지금은 다른 영상을 먼저 보내주세요."
                 )
                 await bot.process_commands(message)
