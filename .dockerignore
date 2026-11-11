@@ -1,4 +1,8 @@
 downloads/
+logs/
+cookies.txt
+cookies_base64.txt
+*.b64
 __pycache__/
 *.pyc
 .git/

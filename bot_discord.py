@@ -3,9 +3,12 @@ import sys
 import re
 import time
 import base64
+import shutil
+import tempfile
 import asyncio
 import subprocess
 import logging
+from contextlib import ExitStack
 from logging.handlers import RotatingFileHandler
 import traceback
 from aiohttp import web
@@ -144,11 +147,36 @@ def compress_video(ffmpeg_exe: str, input_path: str, target_mb: float = 23.0) ->
         raise err
     return out_path
 
+class DownloadDiagnostics:
+    """Keep only known warning categories, never raw warnings or cookies."""
+    def __init__(self):
+        self.flags = set()
+
+    def debug(self, message):
+        pass
+
+    def warning(self, message):
+        text = message.lower()
+        if 'cookies are no longer valid' in text or 'cookies have expired' in text:
+            self.flags.add('cookie_invalid')
+        if 'http error 403' in text:
+            self.flags.add('http_403')
+        if 'http error 429' in text or 'too many requests' in text:
+            self.flags.add('http_429')
+        if 'no supported javascript runtime' in text or 'no supported javascript runtimes' in text:
+            self.flags.add('js_runtime_missing')
+        if 'challenge solving failed' in text or 'challenge solver' in text and 'skipped' in text:
+            self.flags.add('js_challenge_failed')
+
+    def error(self, message):
+        self.warning(message)
+
 # --- 미디어 다운로드 핵심 함수 (단일 영상 + 플레이리스트/다중영상 모두 처리) ---
 def download_media(url: str, output_dir: str = "./downloads"):
     os.makedirs(output_dir, exist_ok=True)
     out_tmpl = os.path.join(output_dir, '%(title).50s [%(id)s].%(ext)s')
 
+    diagnostics = DownloadDiagnostics()
     ydl_opts = {
         'format': 'bestvideo+bestaudio/best',
         'merge_output_format': 'mp4',
@@ -156,7 +184,7 @@ def download_media(url: str, output_dir: str = "./downloads"):
         'nopart': True,
         'windowsfilenames': True,
         'quiet': True,
-        'no_warnings': True,
+        'logger': diagnostics,
         'max_downloads': 10,
         'remote_components': ['ejs:github'],
     }
@@ -164,12 +192,24 @@ def download_media(url: str, output_dir: str = "./downloads"):
     if ffmpeg_exe and ffmpeg_exe != "ffmpeg":
         ydl_opts['ffmpeg_location'] = ffmpeg_exe
 
-    if os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 0:
-        ydl_opts['cookiefile'] = COOKIE_FILE
-        ydl_opts['extractor_args'] = {'youtube': {'player_client': ['web', 'web_safari']}}
+    # yt-dlp saves its cookie jar on close. Give each request a private copy,
+    # so concurrent downloads cannot overwrite one another's cookie file.
+    with ExitStack() as stack:
+        if os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 0:
+            cookie_dir = stack.enter_context(tempfile.TemporaryDirectory(prefix='video-bot-cookies-'))
+            cookie_copy = os.path.join(cookie_dir, 'cookies.txt')
+            shutil.copyfile(COOKIE_FILE, cookie_copy)
+            ydl_opts['cookiefile'] = cookie_copy
+            ydl_opts['extractor_args'] = {'youtube': {'player_client': ['web', 'web_safari']}}
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+        ydl = stack.enter_context(yt_dlp.YoutubeDL(ydl_opts))
+        try:
+            info = ydl.extract_info(url, download=True)
+        except yt_dlp.utils.DownloadError as exc:
+            exc.diagnostic_flags = frozenset(diagnostics.flags)
+            if diagnostics.flags:
+                logger.warning('다운로드 진단 분류: %s', ', '.join(sorted(diagnostics.flags)))
+            raise
 
         def resolve(ent):
             if ent is None:
@@ -269,13 +309,29 @@ async def announce(ctx, *, content: str):
     await ctx.send(f"📢 {content}")
 
 # --- 에러 유형별 친절한 안내 문구 분류 ---
-def friendly_error_message(err_str: str) -> tuple[str, bool]:
+def friendly_error_message(err_str: str, diagnostics=()) -> tuple[str, bool]:
     lower = err_str.lower()
-    if "player response" in err_str or "Sign in to confirm you're not a bot" in err_str:
+    if 'cookie_invalid' in diagnostics:
         return (
-            "⚠️ 유튜브에서 로그인을 요구하여 다운로드가 일시 차단되었습니다. "
-            "같은 링크를 연속 전송하시면 차단이 더 길어집니다. ⏳ 10~15분 후 다시 시도해 주세요. "
-            "(트위터·틱톡·스레드는 정상 작동 중입니다)",
+            '⚠️ 유튜브가 로그인 쿠키가 유효하지 않다고 응답했습니다. 관리자에게 알려주세요.',
+            False,
+        )
+    if "sign in to confirm you're not a bot" in lower:
+        return ('⚠️ 유튜브에서 봇 확인을 위한 로그인을 요구했습니다. 잠시 후 다시 시도해 주세요.', True)
+    if 'player response' in lower:
+        details = []
+        if 'http_403' in diagnostics:
+            details.append('유튜브 요청 일부가 HTTP 403으로 거절됨')
+        if 'http_429' in diagnostics:
+            details.append('유튜브 요청 한도 초과(429)')
+        if 'js_runtime_missing' in diagnostics:
+            details.append('자바스크립트 실행 환경을 찾지 못함')
+        if 'js_challenge_failed' in diagnostics:
+            details.append('유튜브 자바스크립트 처리에 실패함')
+        detail = f"\n진단: {', '.join(details)}." if details else ''
+        return (
+            '⚠️ 유튜브의 영상 정보를 가져오지 못했습니다. 차단인지 다른 문제인지 아직 확인할 수 없습니다.'
+            + detail + '\n잠시 후 다시 시도하거나 관리자에게 알려주세요.',
             True,
         )
     if ("redirected to the login page" in lower
@@ -283,8 +339,7 @@ def friendly_error_message(err_str: str) -> tuple[str, bool]:
             or "instagram send empty" in lower
             or "login_required" in lower):
         return (
-            "⚠️ 인스타그램이 로그인을 요구해 일시 차단되었습니다 (클라우드 IP 공유 한도 도달). "
-            "⏳ 10~15분 후 자동 재시도되거나, 쿠키 등록 시 영구 해결됩니다.",
+            "⚠️ 인스타그램이 로그인을 요구했습니다. 잠시 후 다시 시도하거나 관리자에게 알려주세요.",
             True,
         )
     if "429" in err_str:
@@ -344,7 +399,7 @@ async def auto_retry_worker(url: str, channel_id: int, user_mention: str, origin
         failed_cache.pop(url, None)
     except Exception as exc:
         log_error("자동 재시도 최종 실패", exc, url=url)
-        msg, _ = friendly_error_message(str(exc))
+        msg, _ = friendly_error_message(str(exc), getattr(exc, 'diagnostic_flags', ()))
         try:
             await channel.send(
                 f"{user_mention} ❌ 10분 후 자동 재시도했으나 여전히 차단 상태입니다.\n{msg}\n"
@@ -423,7 +478,7 @@ async def process_job(message: discord.Message, content: str):
     except yt_dlp.utils.DownloadError as e:
         err_str = str(e)
         log_error("다운로드 실패 (yt-dlp)", e, url=content, user=str(message.author))
-        msg, recommend_retry = friendly_error_message(err_str)
+        msg, recommend_retry = friendly_error_message(err_str, getattr(e, 'diagnostic_flags', ()))
         if recommend_retry:
             failed_cache[content] = {"time": time.time(), "user": message.author.id, "scheduled": False}
         await status_msg.edit(
