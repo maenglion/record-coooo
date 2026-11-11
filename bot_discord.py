@@ -20,7 +20,7 @@ logger.setLevel(logging.INFO)
 
 error_handler = RotatingFileHandler(
     os.path.join(LOG_DIR, "error.log"),
-    maxBytes=2 * 1024 * 1024,   # 2MB마다 새 파일로 순환
+    maxBytes=2 * 1024 * 1024,
     backupCount=5,
     encoding="utf-8",
 )
@@ -49,7 +49,6 @@ logger.addHandler(app_handler)
 logger.addHandler(console_handler)
 
 def log_error(context: str, exc: Exception, **meta):
-    """에러를 error.log에 풀 트레이스백과 함께 자동 기록"""
     meta_str = " | ".join(f"{k}={v}" for k, v in meta.items() if v)
     tail = f" ({meta_str})" if meta_str else ""
     logger.error(
@@ -79,10 +78,6 @@ def get_video_duration(ffmpeg_exe: str, video_path: str):
 
 # --- 디스코드 25MB 한도 맞춤 자동 압축 ---
 def compress_video(ffmpeg_exe: str, input_path: str, target_mb: float = 23.0) -> str:
-    """
-    영상 재생시간을 기반으로 최적 비트레이트를 역산하여
-    target_mb 이하의 크기로 자동 압축된 MP4를 생성
-    """
     out_path = input_path.rsplit(".", 1)[0] + "_compressed.mp4"
     duration = get_video_duration(ffmpeg_exe, input_path)
 
@@ -128,8 +123,8 @@ def compress_video(ffmpeg_exe: str, input_path: str, target_mb: float = 23.0) ->
         raise err
     return out_path
 
-# --- 미디어 다운로드 핵심 함수 ---
-def download_video(url: str, output_dir: str = "./downloads"):
+# --- 미디어 다운로드 핵심 함수 (단일 영상 + 플레이리스트/다중영상 모두 처리) ---
+def download_media(url: str, output_dir: str = "./downloads"):
     os.makedirs(output_dir, exist_ok=True)
     out_tmpl = os.path.join(output_dir, '%(title).50s [%(id)s].%(ext)s')
 
@@ -141,6 +136,7 @@ def download_video(url: str, output_dir: str = "./downloads"):
         'windowsfilenames': True,
         'quiet': True,
         'no_warnings': True,
+        'max_downloads': 10,
     }
     ffmpeg_exe = get_ffmpeg_path()
     if ffmpeg_exe and ffmpeg_exe != "ffmpeg":
@@ -148,12 +144,31 @@ def download_video(url: str, output_dir: str = "./downloads"):
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        filepath = ydl.prepare_filename(info)
-        base, _ = os.path.splitext(filepath)
-        merged = base + '.mp4'
-        if os.path.exists(merged):
-            return merged, info.get('title', '영상')
-        return filepath, info.get('title', '영상')
+
+        def resolve(ent):
+            if ent is None:
+                return None
+            fp = ydl.prepare_filename(ent)
+            base, _ = os.path.splitext(fp)
+            for cand in (base + '.mp4', fp):
+                if cand and os.path.exists(cand):
+                    return cand, ent.get('title') or '영상'
+            vid = ent.get('id', '')
+            for name in os.listdir(output_dir):
+                if vid and vid in name and not name.endswith('.part'):
+                    return os.path.join(output_dir, name), ent.get('title') or '영상'
+            return None
+
+        entries = info.get('entries') if info.get('_type') == 'playlist' else None
+        if entries is not None:
+            results = [r for r in (resolve(e) for e in entries) if r]
+        else:
+            r = resolve(info)
+            results = [r] if r else []
+
+        if not results:
+            raise RuntimeError("추출된 영상 파일을 찾을 수 없습니다.")
+        return results
 
 # --- 디스코드 봇 설정 ---
 intents = discord.Intents.default()
@@ -168,7 +183,6 @@ async def on_ready():
 # --- 에러 로그 즉시 조회 명령어 (!logs / !log) ---
 @bot.command(name="logs", aliases=["log"])
 async def show_logs(ctx, lines: int = 25):
-    """최근 에러 로그를 디스코드 채팅으로 조회"""
     log_file = os.path.join(LOG_DIR, "error.log")
     if not os.path.exists(log_file) or os.path.getsize(log_file) == 0:
         await ctx.reply("기록된 에러 로그가 없습니다. (정상 작동 중)")
@@ -195,7 +209,6 @@ async def on_message(message: discord.Message):
 
     content = message.content.strip()
 
-    # 명령어가 아닌 경우만 링크 감지
     if not content.startswith(bot.command_prefix):
         supported = [
             "instagram.com/reel", "instagram.com/p/",
@@ -209,44 +222,48 @@ async def on_message(message: discord.Message):
             status_msg = await message.reply("⏳ 영상 다운로드 중입니다. 잠시만 기다려주세요...")
             try:
                 loop = asyncio.get_event_loop()
-                video_path, title = await loop.run_in_executor(None, download_video, content)
+                results = await loop.run_in_executor(None, download_media, content)
 
-                file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
-                send_path = video_path
+                send_queue = []
+                for idx, (video_path, title) in enumerate(results, 1):
+                    file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+                    send_path = video_path
 
-                # 25MB 초과 시 디스코드 전송용 자동 압축
-                if file_size_mb > 24.5:
-                    await status_msg.edit(
-                        content=f"⚠️ 영상 크기({file_size_mb:.1f}MB)가 디스코드 한도(25MB)를 초과하여 자동 압축 중입니다... "
-                                f"(길이에 따라 30초~2분 소요)"
-                    )
-                    try:
-                        ffmpeg_exe = get_ffmpeg_path()
-                        compressed = await loop.run_in_executor(
-                            None, compress_video, ffmpeg_exe, video_path, 23.0
-                        )
-                        new_size = os.path.getsize(compressed) / (1024 * 1024)
-                        logger.info(f"압축 완료: {file_size_mb:.1f}MB -> {new_size:.1f}MB url={content}")
-                        send_path = compressed
-                    except Exception as ce:
-                        log_error("자동 압축 처리 실패", ce, url=content, user=str(message.author))
+                    if file_size_mb > 24.5:
+                        tag = f" ({idx}/{len(results)})" if len(results) > 1 else ""
                         await status_msg.edit(
-                            content=f"❌ 자동 압축 실패: {ce}\n원본 영상은 서버 downloads 폴더에만 보관되었습니다.\n"
-                                    f"(상세 로그는 `!logs` 명령어로 확인 가능합니다.)"
+                            content=f"⚠️ 영상{tag} 크기({file_size_mb:.1f}MB)가 디스코드 한도(25MB)를 초과하여 자동 압축 중입니다... "
+                                    f"(30초~2분 소요)"
                         )
-                        return
+                        try:
+                            ffmpeg_exe = get_ffmpeg_path()
+                            compressed = await loop.run_in_executor(
+                                None, compress_video, ffmpeg_exe, video_path, 23.0
+                            )
+                            new_size = os.path.getsize(compressed) / (1024 * 1024)
+                            logger.info(f"압축 완료: {file_size_mb:.1f}MB -> {new_size:.1f}MB file={os.path.basename(video_path)}")
+                            send_path = compressed
+                        except Exception as ce:
+                            log_error("자동 압축 처리 실패", ce, url=content, file=video_path)
+                            await status_msg.edit(
+                                content=f"❌ 자동 압축 실패: {ce}\n원본 영상은 서버 downloads 폴더에만 보관되었습니다.\n"
+                                        f"(상세 로그는 `!logs` 명령어로 확인 가능합니다.)"
+                            )
+                            return
+                    send_queue.append((send_path, video_path, title))
 
                 await status_msg.edit(content="📤 영상을 업로드하는 중입니다...")
-                await message.reply(file=discord.File(send_path))
-                await status_msg.delete()
-                logger.info(f"전송 완료: {title} ({os.path.basename(send_path)})")
+                for idx, (send_path, original_path, title) in enumerate(send_queue, 1):
+                    tag = f"{idx}/{len(send_queue)}" if len(send_queue) > 1 else ""
+                    await message.reply(tag or None, file=discord.File(send_path))
+                    logger.info(f"전송 완료: {title} ({os.path.basename(send_path)})")
+                    if send_path != original_path and os.path.exists(send_path):
+                        try:
+                            os.remove(send_path)
+                        except OSError as exc:
+                            log_error("압축 임시파일 삭제 실패", exc, path=send_path)
 
-                # 압축 임시 파일 정리 (원본은 downloads에 계속 보관)
-                if send_path != video_path and os.path.exists(send_path):
-                    try:
-                        os.remove(send_path)
-                    except OSError as exc:
-                        log_error("압축 임시파일 삭제 실패", exc, path=send_path)
+                await status_msg.delete()
 
             except yt_dlp.utils.DownloadError as e:
                 log_error("다운로드 실패 (yt-dlp)", e, url=content, user=str(message.author))
