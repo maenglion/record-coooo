@@ -58,23 +58,23 @@ def log_error(context: str, exc: Exception, **meta):
     )
 
 # --- 동시성·큐 격리 (한 사람의 실패가 다른 사람 요청에 영향 없도록) ---
-JOB_SEMAPHORE = asyncio.Semaphore(3)   # 512MB RAM 보호용 동시 최대 3개
-TASK_TIMEOUT = 180                     # 작업당 최대 3분 하드 타임아웃
-RETRY_COOLDOWN_SECONDS = 600           # 같은 실패 URL은 10분 후 자동 재시도
-# url -> {"time": ts, "user": id, "channel_id": id, "retries": n, "scheduled": bool}
+JOB_SEMAPHORE = asyncio.Semaphore(3)
+TASK_TIMEOUT = 180
+RETRY_COOLDOWN_SECONDS = 600
 failed_cache: dict[str, dict] = {}
 auto_retry_tasks: dict[str, asyncio.Task] = {}
 
-# --- YouTube 쿠키 주입 (데이터센터 IP 봇 차단 우회용) ---
-COOKIE_FILE = os.path.join(LOG_DIR, "youtube_cookies.txt")
-_yt_cookie_b64 = os.getenv("YOUTUBE_COOKIES_BASE64", "").strip()
-if _yt_cookie_b64:
+# --- 쿠키 주입 (유튜브 로그인 차단 및 인스타 익명 한도 우회) ---
+COOKIE_FILE = os.path.join(LOG_DIR, "cookies.txt")
+_cookie_b64 = (os.getenv("COOKIES_BASE64", "").strip()
+               or os.getenv("YOUTUBE_COOKIES_BASE64", "").strip())
+if _cookie_b64:
     try:
         with open(COOKIE_FILE, "wb") as _cf:
-            _cf.write(base64.b64decode(_yt_cookie_b64))
-        logger.info("YouTube 쿠키 파일 주입 완료")
+            _cf.write(base64.b64decode(_cookie_b64))
+        logger.info("쿠키 파일 주입 완료")
     except Exception as _exc:
-        logger.error(f"YouTube 쿠키 디코딩 실패: {_exc}")
+        logger.error(f"쿠키 디코딩 실패: {_exc}")
 
 # --- ffmpeg 경로 자동 감지 ---
 def get_ffmpeg_path():
@@ -212,8 +212,7 @@ async def on_ready():
     logger.info(f"디스코드 봇 로그인 완료: {bot.user}")
     print("스마트폰 디스코드 앱에서 봇에게 인스타/트위터/유튜브/틱톡/스레드 링크를 보내보세요.")
 
-    # [요구사항 2] 버전별 최초 기동 시 복구·공지 1회 발송
-    announce_flag = os.path.join(LOG_DIR, ".announced_v6")
+    announce_flag = os.path.join(LOG_DIR, ".announced_v7")
     if not os.path.exists(announce_flag):
         body = (
             "📢 **MyVideoDownloader 봇 업데이트 공지**\n"
@@ -221,7 +220,7 @@ async def on_ready():
             "▫ 작업 완전 분리(누군가의 실패가 다른 사람 요청에 영향 없음)\n"
             "▫ 차단 영상 10분 후 자동 재시도 안내 시스템 적용\n"
             "▫ 대용량 영상 25MB 이하 자동 압축 유지\n"
-            "※ 유튜브는 클라우드 봇 차단 이슈로 쿠키 설정 후 정상화 예정 (인스타/X/틱톡/스레드는 정상)"
+            "※ 유튜브/인스타 일부 차단은 로그인 쿠키 설정 후 완전 정상화됩니다 (트위터/틱톡/스레드는 정상)"
         )
         for guild in bot.guilds:
             for ch in guild.text_channels:
@@ -269,12 +268,21 @@ async def announce(ctx, *, content: str):
 
 # --- 에러 유형별 친절한 안내 문구 분류 ---
 def friendly_error_message(err_str: str) -> tuple[str, bool]:
-    """(안내문구, 자동재시도 추천 여부)"""
+    lower = err_str.lower()
     if "player response" in err_str or "Sign in to confirm you're not a bot" in err_str:
         return (
             "⚠️ 유튜브에서 로그인을 요구하여 다운로드가 일시 차단되었습니다. "
             "같은 링크를 연속 전송하시면 차단이 더 길어집니다. ⏳ 10~15분 후 다시 시도해 주세요. "
-            "(인스타그램·트위터·틱톡·스레드는 정상 작동 중입니다)",
+            "(트위터·틱톡·스레드는 정상 작동 중입니다)",
+            True,
+        )
+    if ("redirected to the login page" in lower
+            or "rate-limit for accessing posts anonymously" in lower
+            or "instagram send empty" in lower
+            or "login_required" in lower):
+        return (
+            "⚠️ 인스타그램이 로그인을 요구해 일시 차단되었습니다 (클라우드 IP 공유 한도 도달). "
+            "⏳ 10~15분 후 자동 재시도되거나, 쿠키 등록 시 영구 해결됩니다.",
             True,
         )
     if "429" in err_str:
@@ -289,7 +297,7 @@ def friendly_error_message(err_str: str) -> tuple[str, bool]:
         return ("❌ 비공개 계정 또는 비공개 영상입니다.", False)
     return (f"❌ 처리 중 오류 발생: {err_str[:400]}", False)
 
-# --- 10분 후 자동 재시도 워커 (요구사항 4) ---
+# --- 10분 후 자동 재시도 워커 ---
 async def auto_retry_worker(url: str, channel_id: int, user_mention: str, original_url: str):
     await asyncio.sleep(RETRY_COOLDOWN_SECONDS)
     channel = bot.get_channel(channel_id)
@@ -350,7 +358,7 @@ async def auto_retry_worker(url: str, channel_id: int, user_mention: str, origin
                 pass
         auto_retry_tasks.pop(url, None)
 
-# --- 독립 작업 처리 함수 (요구사항 1: 한 사람 실패가 다른 사람 요청에 영향 없음) ---
+# --- 독립 작업 처리 함수 (한 사람 실패가 다른 사람 요청에 영향 없음) ---
 async def process_job(message: discord.Message, content: str):
     logger.info(f"다운로드 요청: user={message.author} channel={message.channel} url={content}")
     status_msg = await message.reply("⏳ 영상 다운로드 중입니다. 잠시만 기다려주세요...")
@@ -402,7 +410,7 @@ async def process_job(message: discord.Message, content: str):
                     log_error("압축 임시파일 삭제 실패", exc, path=send_path)
 
         await status_msg.delete()
-        failed_cache.pop(content, None)  # 성공 시 실패 캐시 해제
+        failed_cache.pop(content, None)
 
     except asyncio.TimeoutError:
         log_error("다운로드 작업 타임아웃(3분 초과)", TimeoutError(), url=content)
@@ -435,7 +443,7 @@ async def on_message(message: discord.Message):
 
     if not content.startswith(bot.command_prefix):
         if any(k in content for k in SUPPORTED):
-            # [요구사항 4] 같은 실패 URL의 반복 전송 방어 + 10분 후 자동 재시도
+            # 같은 실패 URL 반복 전송 방어 + 10분 후 자동 재시도
             last = failed_cache.get(content)
             now = time.time()
             if last and (now - last["time"]) < RETRY_COOLDOWN_SECONDS:
@@ -460,7 +468,6 @@ async def on_message(message: discord.Message):
                 await bot.process_commands(message)
                 return
 
-            # 독립 비동기 태스크로 실행 (작업 완전 분리)
             asyncio.create_task(process_job(message, content))
 
     await bot.process_commands(message)
