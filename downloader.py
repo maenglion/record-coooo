@@ -22,10 +22,16 @@ def download_video(url: str, output_dir: str = "./downloads"):
         'quiet': False,
         'no_warnings': False,
         'max_downloads': 10,
+        'remote_components': ['ejs:github'],
     }
     ffmpeg_exe = get_ffmpeg_path()
     if ffmpeg_exe and ffmpeg_exe != "ffmpeg":
         ydl_opts['ffmpeg_location'] = ffmpeg_exe
+
+    cookie_file = os.path.join(os.path.dirname(__file__), "cookies.txt")
+    if os.path.exists(cookie_file) and os.path.getsize(cookie_file) > 0:
+        ydl_opts['cookiefile'] = cookie_file
+        ydl_opts['extractor_args'] = {'youtube': {'player_client': ['web', 'web_safari']}}
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -35,7 +41,7 @@ def download_video(url: str, output_dir: str = "./downloads"):
                 return None
             fp = ydl.prepare_filename(ent)
             base, _ = os.path.splitext(fp)
-            for cand in (base + '.mp4', fp):
+            for cand in (base + '.mp4', base + '.webm', fp):
                 if cand and os.path.exists(cand):
                     return cand
             vid = ent.get('id', '')

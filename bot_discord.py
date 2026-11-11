@@ -158,6 +158,7 @@ def download_media(url: str, output_dir: str = "./downloads"):
         'quiet': True,
         'no_warnings': True,
         'max_downloads': 10,
+        'remote_components': ['ejs:github'],
     }
     ffmpeg_exe = get_ffmpeg_path()
     if ffmpeg_exe and ffmpeg_exe != "ffmpeg":
@@ -165,6 +166,7 @@ def download_media(url: str, output_dir: str = "./downloads"):
 
     if os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 0:
         ydl_opts['cookiefile'] = COOKIE_FILE
+        ydl_opts['extractor_args'] = {'youtube': {'player_client': ['web', 'web_safari']}}
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -174,7 +176,7 @@ def download_media(url: str, output_dir: str = "./downloads"):
                 return None
             fp = ydl.prepare_filename(ent)
             base, _ = os.path.splitext(fp)
-            for cand in (base + '.mp4', fp):
+            for cand in (base + '.mp4', base + '.webm', fp):
                 if cand and os.path.exists(cand):
                     return cand, ent.get('title') or '영상'
             vid = ent.get('id', '')
@@ -443,7 +445,6 @@ async def on_message(message: discord.Message):
 
     if not content.startswith(bot.command_prefix):
         if any(k in content for k in SUPPORTED):
-            # 같은 실패 URL 반복 전송 방어 + 10분 후 자동 재시도
             last = failed_cache.get(content)
             now = time.time()
             if last and (now - last["time"]) < RETRY_COOLDOWN_SECONDS:
