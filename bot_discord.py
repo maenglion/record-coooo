@@ -1,6 +1,7 @@
 import os
 import sys
 import re
+import base64
 import asyncio
 import subprocess
 import logging
@@ -54,6 +55,17 @@ def log_error(context: str, exc: Exception, **meta):
     logger.error(
         f"{context}{tail}: {exc}\n{''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))}"
     )
+
+# --- YouTube 쿠키 주입 (데이터센터 IP 봇 차단 우회용) ---
+COOKIE_FILE = os.path.join(LOG_DIR, "youtube_cookies.txt")
+_yt_cookie_b64 = os.getenv("YOUTUBE_COOKIES_BASE64", "").strip()
+if _yt_cookie_b64:
+    try:
+        with open(COOKIE_FILE, "wb") as _cf:
+            _cf.write(base64.b64decode(_yt_cookie_b64))
+        logger.info("YouTube 쿠키 파일 주입 완료")
+    except Exception as _exc:
+        logger.error(f"YouTube 쿠키 디코딩 실패: {_exc}")
 
 # --- ffmpeg 경로 자동 감지 ---
 def get_ffmpeg_path():
@@ -141,6 +153,9 @@ def download_media(url: str, output_dir: str = "./downloads"):
     ffmpeg_exe = get_ffmpeg_path()
     if ffmpeg_exe and ffmpeg_exe != "ffmpeg":
         ydl_opts['ffmpeg_location'] = ffmpeg_exe
+
+    if os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 0:
+        ydl_opts['cookiefile'] = COOKIE_FILE
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -266,9 +281,13 @@ async def on_message(message: discord.Message):
                 await status_msg.delete()
 
             except yt_dlp.utils.DownloadError as e:
+                err_str = str(e)
                 log_error("다운로드 실패 (yt-dlp)", e, url=content, user=str(message.author))
+                hint = ""
+                if "player response" in err_str or "Sign in to confirm" in err_str:
+                    hint = "\n💡 유튜브 측 봇 차단(로그인 요구)으로 인한 실패입니다. PC 터미널에서 다운로드하거나 쿠키 주입이 필요합니다."
                 await status_msg.edit(
-                    content=f"❌ 다운로드 실패 (비공개 또는 잘못된 링크): {e}\n"
+                    content=f"❌ 다운로드 실패 (비공개 또는 잘못된 링크): {err_str}{hint}\n"
                             f"(상세 로그는 `!logs` 명령어로 확인 가능합니다.)"
                 )
             except Exception as e:
