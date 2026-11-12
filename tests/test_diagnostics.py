@@ -10,6 +10,54 @@ import bot_discord as app
 
 
 class DiagnosticsTests(unittest.TestCase):
+    def test_platform_url_filter(self):
+        examples = [
+            'https://www.facebook.com/share/v/1eBuvP5VrN/',
+            'https://fb.watch/example/',
+            'https://www.threads.com/share/BAcTPWwMby/',
+            'https://www.instagram.com/reel/DfZXTucyqJI/',
+            'https://x.com/example/status/123',
+        ]
+        for url in examples:
+            with self.subTest(url=url):
+                self.assertEqual(app.first_supported_url('영상 부탁해요 ' + url), url)
+        for url in ('https://facebook.com.evil.example/v/123',
+                    'https://youtube.com@evil.example/watch?v=1',
+                    'https://example.com/?url=facebook.com',
+                    'http://facebook.com/share/v/abc',
+                    'https://facebook.com:8080/share/v/abc'):
+            with self.subTest(url=url):
+                self.assertIsNone(app.first_supported_url(url))
+
+    def test_unverified_threads_share_is_rejected(self):
+        class FakeYDL:
+            def __init__(self, opts):
+                self.opts = opts
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def extract_info(self, url, download):
+                self.opts['logger'].warning('Could not determine which post this link points to; using the first video on the page.')
+                return {'id': 'unrelated-video'}
+
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(app, 'COOKIE_FILE', os.path.join(directory, 'missing')), \
+             mock.patch.object(app.yt_dlp, 'YoutubeDL', FakeYDL):
+            with self.assertRaisesRegex(yt_dlp.utils.DownloadError, 'Could not verify which post'):
+                app.download_media('https://threads.com/share/example/', directory)
+
+    def test_threads_no_video_does_not_claim_block_or_no_video_for_sure(self):
+        msg, retry = app.friendly_error_message(
+            'ERROR: [threads] Post "DfmjHzvAe1W" has no downloadable video (text-only or unsupported)'
+        )
+        self.assertIn('찾지 못했어요', msg)
+        self.assertIn('수 있습니다', msg)
+        self.assertFalse(retry)
+
     def test_youtube_player_error_not_automatically_called_login_block(self):
         msg, retry = app.friendly_error_message('ERROR: [youtube] Failed to extract any player response')
         self.assertTrue(retry)

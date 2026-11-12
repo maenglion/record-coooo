@@ -11,6 +11,7 @@ import logging
 from contextlib import ExitStack
 from logging.handlers import RotatingFileHandler
 import traceback
+from urllib.parse import urlsplit
 from aiohttp import web
 import discord
 from discord.ext import commands
@@ -167,6 +168,8 @@ class DownloadDiagnostics:
             self.flags.add('js_runtime_missing')
         if 'challenge solving failed' in text or 'challenge solver' in text and 'skipped' in text:
             self.flags.add('js_challenge_failed')
+        if 'could not determine which post this link points to' in text:
+            self.flags.add('threads_unverified_target')
 
     def error(self, message):
         self.warning(message)
@@ -205,6 +208,10 @@ def download_media(url: str, output_dir: str = "./downloads"):
         ydl = stack.enter_context(yt_dlp.YoutubeDL(ydl_opts))
         try:
             info = ydl.extract_info(url, download=True)
+            if 'threads_unverified_target' in diagnostics.flags:
+                raise yt_dlp.utils.DownloadError(
+                    'ERROR: [threads] Could not verify which post this share link points to'
+                )
         except yt_dlp.utils.DownloadError as exc:
             exc.diagnostic_flags = frozenset(diagnostics.flags)
             if diagnostics.flags:
@@ -241,13 +248,30 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-SUPPORTED = [
-    "instagram.com/reel", "instagram.com/p/",
-    "twitter.com", "x.com",
-    "youtube.com", "youtu.be",
-    "tiktok.com",
-    "threads.net", "threads.com",
-]
+def first_supported_url(content: str):
+    """Extract a URL with an exact supported host or a genuine subdomain."""
+    domains = (
+        'instagram.com', 'twitter.com', 'x.com', 'youtube.com', 'youtu.be',
+        'tiktok.com', 'threads.net', 'threads.com', 'facebook.com', 'fb.watch',
+    )
+    for match in re.finditer(r'https?://[^\s<>]+', content, flags=re.IGNORECASE):
+        url = match.group(0).rstrip('.,)')
+        try:
+            parts = urlsplit(url)
+            host = (parts.hostname or '').lower()
+            if parts.scheme.lower() != 'https' or parts.port not in (None, 443):
+                continue
+            if parts.username or parts.password or not any(
+                host == domain or host.endswith('.' + domain) for domain in domains
+            ):
+                continue
+            if host == 'instagram.com' or host.endswith('.instagram.com'):
+                if not (parts.path.startswith('/reel') or parts.path.startswith('/p/')):
+                    continue
+            return url
+        except ValueError:
+            continue
+    return None
 
 @bot.event
 async def on_ready():
@@ -331,6 +355,18 @@ def friendly_error_message(err_str: str, diagnostics=()) -> tuple[str, bool]:
             '⚠️ 유튜브의 영상 정보를 가져오지 못했습니다. 차단인지 다른 문제인지 아직 확인할 수 없습니다.'
             + detail + '\n잠시 후 다시 시도하거나 관리자에게 알려주세요.',
             True,
+        )
+    if '[threads]' in lower and ('no downloadable video' in lower or 'no video post found' in lower):
+        return (
+            '⚠️ 스레드 게시물에서 다운로드 가능한 영상을 찾지 못했어요. '
+            '영상이 없는 게시물이거나, 공유 링크 또는 스레드 응답 형식을 추출기가 처리하지 못했을 수 있습니다.',
+            False,
+        )
+    if '[threads]' in lower and 'could not verify which post' in lower:
+        return (
+            '⚠️ 공유 링크의 게시물을 정확히 확인하지 못했어요. 다른 영상을 잘못 보내지 않도록 중단했습니다. '
+            '스레드에서 게시물 주소를 다시 복사해 보내 주세요.',
+            False,
         )
     if ("redirected to the login page" in lower
             or "rate-limit for accessing posts anonymously" in lower
@@ -497,7 +533,8 @@ async def on_message(message: discord.Message):
     content = message.content.strip()
 
     if not content.startswith(bot.command_prefix):
-        if any(k in content for k in SUPPORTED):
+        content = first_supported_url(content)
+        if content:
             last = failed_cache.get(content)
             now = time.time()
             if last and (now - last["time"]) < RETRY_COOLDOWN_SECONDS:
