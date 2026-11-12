@@ -153,6 +153,7 @@ class DownloadDiagnostics:
     """Keep only known warning categories, never raw warnings or cookies."""
     def __init__(self):
         self.flags = set()
+        self.http_stages = set()
 
     def debug(self, message):
         pass
@@ -165,6 +166,20 @@ class DownloadDiagnostics:
             self.flags.add('http_403')
         if 'http error 429' in text or 'too many requests' in text:
             self.flags.add('http_429')
+        for status in ('403', '429'):
+            if f'http error {status}' not in text and not (status == '429' and 'too many requests' in text):
+                continue
+            if 'unable to download api page' in text:
+                stage = 'API 페이지'
+            elif 'unable to download webpage' in text:
+                stage = '웹페이지'
+            elif 'challenge' in text or '[jsc' in text or 'solver' in text:
+                stage = 'JS 처리/구성요소'
+            elif 'm3u8' in text or 'manifest' in text:
+                stage = '미디어 목록'
+            else:
+                stage = '단계 미확인'
+            self.http_stages.add((stage, status))
         if 'no supported javascript runtime' in text or 'no supported javascript runtimes' in text:
             self.flags.add('js_runtime_missing')
         if 'challenge solving failed' in text or 'challenge solver' in text and 'skipped' in text:
@@ -175,7 +190,7 @@ class DownloadDiagnostics:
     def error(self, message):
         self.warning(message)
 
-def youtube_diagnostic_probe(mode: str, video_id: str = 'ty_mcAhgiaE'):
+def youtube_diagnostic_probe(mode: str, video_id: str = 'ty_mcAhgiaE', show_stages: bool = False):
     """Run one metadata-only probe; return only predefined, non-secret result codes."""
     diagnostic = DownloadDiagnostics()
     opts = {
@@ -188,6 +203,8 @@ def youtube_diagnostic_probe(mode: str, video_id: str = 'ty_mcAhgiaE'):
         'extractor_retries': 0,
         'remote_components': ['ejs:github'],
     }
+    if show_stages:
+        opts['format'] = 'best[ext=mp4]/best'
     with ExitStack() as stack:
         if mode != 'anonymous':
             if not os.path.isfile(COOKIE_FILE) or not os.path.getsize(COOKIE_FILE):
@@ -221,7 +238,11 @@ def youtube_diagnostic_probe(mode: str, video_id: str = 'ty_mcAhgiaE'):
         'js_challenge_failed': 'JS 처리 실패',
     }
     flags = [labels[x] for x in sorted(diagnostic.flags) if x in labels]
-    return outcome + (f"; 경고: {', '.join(flags)}" if flags else '')
+    result = outcome + (f"; 경고: {', '.join(flags)}" if flags else '')
+    if show_stages:
+        stages = ', '.join(f'{stage}: {code}' for stage, code in sorted(diagnostic.http_stages))
+        result += '\nHTTP 경고 단계: ' + (stages or '확인된 정보 없음')
+    return result
 
 def youtube_cookie_status():
     """Check cookie domains only, never display their names or values."""
@@ -412,6 +433,24 @@ async def youtube_check(ctx):
         except Exception:
             logger.error('유튜브 진단 도중 내부 오류 (상세 내용 비공개)')
             await status.edit(content='⚠️ 진단을 마치지 못했습니다. 관리자에게 알려주세요.')
+
+@bot.command(name='ytwhere')
+@commands.has_guild_permissions(administrator=True)
+@commands.cooldown(1, 3600, commands.BucketType.guild)
+async def youtube_where(ctx):
+    """One anonymous metadata-only probe; report safe stage labels, never raw logs."""
+    status = await ctx.reply('🔎 유튜브 오류 단계를 확인합니다. 영상 파일은 받지 않고 쿠키도 사용하지 않습니다.')
+    async with JOB_SEMAPHORE:
+        try:
+            result = await asyncio.to_thread(youtube_diagnostic_probe, 'anonymous', show_stages=True)
+            await status.edit(content=(
+                '🔎 **유튜브 접속 단계 진단**\n' + result + '\n'
+                '※ 진단은 영상 정보만 확인합니다. 요청에 따라 여러 HTTP 연결이 생길 수 있으며, '
+                '단계는 경고 문구 기준이고 해당 서버나 원인까지 확정하지 않습니다.'
+            ))
+        except Exception:
+            logger.error('유튜브 단계 진단 도중 내부 오류 (상세 내용 비공개)')
+            await status.edit(content='⚠️ 유튜브 단계 진단을 마치지 못했습니다.')
 
 # --- 공지 수동 발송 명령어 (!공지 내용) ---
 @bot.command(name="공지")

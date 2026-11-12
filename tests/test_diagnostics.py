@@ -10,6 +10,39 @@ import bot_discord as app
 
 
 class DiagnosticsTests(unittest.TestCase):
+    def test_youtube_where_categorizes_http_stages_without_raw_text(self):
+        recorded = []
+        secret = 'PRIVATE_SENTINEL_123'
+
+        class FakeYDL:
+            def __init__(self, opts):
+                self.opts = opts
+                recorded.append(opts)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def extract_info(self, url, download):
+                self.opts['logger'].warning('Unable to download webpage: HTTP Error 429: ' + secret)
+                self.opts['logger'].warning('Unable to download API page: HTTP Error 403: ' + secret)
+                raise yt_dlp.utils.DownloadError('Failed to extract any player response')
+
+        with mock.patch.object(app.yt_dlp, 'YoutubeDL', FakeYDL):
+            result = app.youtube_diagnostic_probe('anonymous', show_stages=True)
+        self.assertEqual(len(recorded), 1)
+        self.assertNotIn('cookiefile', recorded[0])
+        self.assertNotIn('extractor_args', recorded[0])
+        self.assertEqual(recorded[0]['format'], 'best[ext=mp4]/best')
+        self.assertTrue(recorded[0]['skip_download'])
+        self.assertEqual(recorded[0]['retries'], 0)
+        self.assertEqual(recorded[0]['extractor_retries'], 0)
+        self.assertIn('웹페이지: 429', result)
+        self.assertIn('API 페이지: 403', result)
+        self.assertNotIn(secret, result)
+
     def test_youtube_probe_compares_options_without_disclosing_errors(self):
         captured = []
         secret = 'SENSITIVE_VALUE_MUST_NOT_APPEAR'
