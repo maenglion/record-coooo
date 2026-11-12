@@ -10,6 +10,50 @@ import bot_discord as app
 
 
 class DiagnosticsTests(unittest.TestCase):
+    def test_youtube_probe_compares_options_without_disclosing_errors(self):
+        captured = []
+        secret = 'SENSITIVE_VALUE_MUST_NOT_APPEAR'
+
+        class FakeYDL:
+            def __init__(self, opts):
+                self.opts = opts
+                captured.append(opts)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def extract_info(self, url, download):
+                self.opts['logger'].warning('HTTP Error 403: Forbidden')
+                raise yt_dlp.utils.DownloadError('Failed to extract any player response ' + secret)
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = os.path.join(directory, 'cookies.txt')
+            with open(source, 'w', encoding='utf-8') as f:
+                f.write('test cookie')
+            with mock.patch.object(app, 'COOKIE_FILE', source), \
+                 mock.patch.object(app.yt_dlp, 'YoutubeDL', FakeYDL):
+                results = [app.youtube_diagnostic_probe(m) for m in ('current', 'default_cookie', 'anonymous')]
+        self.assertEqual(captured[0]['extractor_args']['youtube']['player_client'], ['web', 'web_safari'])
+        self.assertNotIn('extractor_args', captured[1])
+        self.assertNotIn('cookiefile', captured[2])
+        self.assertTrue(all('HTTP 403' in result for result in results))
+        self.assertTrue(all(secret not in result for result in results))
+        self.assertTrue(all(o['skip_download'] and o['retries'] == 0 for o in captured))
+
+    def test_youtube_cookie_domain_status_does_not_claim_cookie_validity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = os.path.join(directory, 'cookies.txt')
+            with open(source, 'w', encoding='utf-8') as f:
+                f.write('# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tsecret\n')
+            with mock.patch.object(app, 'COOKIE_FILE', source):
+                result = app.youtube_cookie_status()
+        self.assertIn('도메인 쿠키 있음', result)
+        self.assertIn('유효 여부 미확인', result)
+        self.assertNotIn('secret', result)
+
     def test_platform_url_filter(self):
         examples = [
             'https://www.facebook.com/share/v/1eBuvP5VrN/',

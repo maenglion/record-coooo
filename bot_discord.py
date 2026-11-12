@@ -8,6 +8,7 @@ import tempfile
 import asyncio
 import subprocess
 import logging
+import http.cookiejar
 from contextlib import ExitStack
 from logging.handlers import RotatingFileHandler
 import traceback
@@ -174,6 +175,67 @@ class DownloadDiagnostics:
     def error(self, message):
         self.warning(message)
 
+def youtube_diagnostic_probe(mode: str, video_id: str = 'ty_mcAhgiaE'):
+    """Run one metadata-only probe; return only predefined, non-secret result codes."""
+    diagnostic = DownloadDiagnostics()
+    opts = {
+        'quiet': True,
+        'logger': diagnostic,
+        'skip_download': True,
+        'noplaylist': True,
+        'socket_timeout': 10,
+        'retries': 0,
+        'extractor_retries': 0,
+        'remote_components': ['ejs:github'],
+    }
+    with ExitStack() as stack:
+        if mode != 'anonymous':
+            if not os.path.isfile(COOKIE_FILE) or not os.path.getsize(COOKIE_FILE):
+                return '쿠키 파일 없음'
+            directory = stack.enter_context(tempfile.TemporaryDirectory(prefix='video-bot-check-'))
+            cookie_copy = os.path.join(directory, 'cookies.txt')
+            shutil.copyfile(COOKIE_FILE, cookie_copy)
+            opts['cookiefile'] = cookie_copy
+            if mode == 'current':
+                opts['extractor_args'] = {'youtube': {'player_client': ['web', 'web_safari']}}
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(f'https://www.youtube.com/watch?v={video_id}', download=False)
+            outcome = '영상 정보 확인됨 (실제 다운로드는 미검증)' if info else '영상 정보 없음'
+        except Exception as exc:
+            text = str(exc).lower().replace('’', "'")
+            diagnostic.warning(text)
+            if 'sign in to confirm' in text or 'login_required' in text:
+                outcome = '유튜브 로그인/봇 확인 요구'
+            elif 'failed to extract any player response' in text:
+                outcome = '유튜브 응답 추출 실패 (원인 미확정)'
+            elif 'private video' in text or 'video unavailable' in text:
+                outcome = '영상 접근 불가'
+            else:
+                outcome = '영상 정보 확인 실패 (세부 원인 미확정)'
+    labels = {
+        'cookie_invalid': '쿠키 무효 경고',
+        'http_403': 'HTTP 403',
+        'http_429': 'HTTP 429',
+        'js_runtime_missing': 'JS 실행기 미발견',
+        'js_challenge_failed': 'JS 처리 실패',
+    }
+    flags = [labels[x] for x in sorted(diagnostic.flags) if x in labels]
+    return outcome + (f"; 경고: {', '.join(flags)}" if flags else '')
+
+def youtube_cookie_status():
+    """Check cookie domains only, never display their names or values."""
+    if not os.path.isfile(COOKIE_FILE) or not os.path.getsize(COOKIE_FILE):
+        return '쿠키 파일 없음'
+    try:
+        jar = http.cookiejar.MozillaCookieJar(COOKIE_FILE)
+        jar.load(ignore_discard=True, ignore_expires=True)
+        present = any(c.domain.lstrip('.').lower() in ('youtube.com', 'www.youtube.com')
+                      or c.domain.lstrip('.').lower().endswith('.youtube.com') for c in jar)
+        return '유튜브 도메인 쿠키 있음 (유효 여부 미확인)' if present else '유튜브 도메인 쿠키 없음'
+    except (OSError, http.cookiejar.LoadError, ValueError):
+        return '쿠키 파일 형식 확인 실패'
+
 # --- 미디어 다운로드 핵심 함수 (단일 영상 + 플레이리스트/다중영상 모두 처리) ---
 def download_media(url: str, output_dir: str = "./downloads"):
     os.makedirs(output_dir, exist_ok=True)
@@ -322,6 +384,34 @@ async def show_logs(ctx, lines: int = 25):
     except Exception as exc:
         log_error("!logs 명령어 처리 실패", exc)
         await ctx.reply(f"로그 파일 읽기 실패: {exc}")
+
+@bot.command(name='ytcheck')
+@commands.has_guild_permissions(administrator=True)
+@commands.cooldown(1, 180, commands.BucketType.guild)
+async def youtube_check(ctx):
+    """A bounded, manual diagnostic; no videos, raw errors or credentials are sent."""
+    status = await ctx.reply('🔎 관리자 진단 중입니다. 같은 영상의 정보만 확인하며 다운로드하지 않습니다.')
+    async with JOB_SEMAPHORE:
+        def check():
+            cookie_status = youtube_cookie_status()
+            deno = '확인됨' if shutil.which('deno') else '찾지 못함'
+            version = yt_dlp.version.__version__
+            modes = [('현재 설정', 'current'), ('쿠키 + 기본 접속 방식', 'default_cookie'),
+                     ('쿠키 없이 기본 접속 방식', 'anonymous')]
+            results = [(label, youtube_diagnostic_probe(mode)) for label, mode in modes]
+            return cookie_status, deno, version, results
+
+        try:
+            cookie_status, deno, version, results = await asyncio.to_thread(check)
+            report = '\n'.join(f'• {label}: {result}' for label, result in results)
+            await status.edit(content=(
+                f'🔎 **유튜브 진단 결과**\nyt-dlp: {version} | Deno: {deno}\n'
+                f'쿠키: {cookie_status}\n{report}\n'
+                '※ 영상 정보 확인 결과이며, 다운로드 성공이나 쿠키 유효성을 보장하지 않습니다.'
+            ))
+        except Exception:
+            logger.error('유튜브 진단 도중 내부 오류 (상세 내용 비공개)')
+            await status.edit(content='⚠️ 진단을 마치지 못했습니다. 관리자에게 알려주세요.')
 
 # --- 공지 수동 발송 명령어 (!공지 내용) ---
 @bot.command(name="공지")
